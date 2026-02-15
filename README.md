@@ -7,3 +7,5 @@ Use this template to create a new CloudFormation stack.
 
 Currently it deploys two SSM managed instances (Ubuntu and Linux). You can mess around with the parameters if you so desire. It is part of a larger project to develop a robust honeypot architecture in AWS. 
 
+*It should be noted that this is incomplete. It deploys but you may want to tweak certain group rules to get what you want*
+
