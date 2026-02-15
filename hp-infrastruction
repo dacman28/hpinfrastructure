@@ -1,0 +1,503 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  Insecure lab VPC with:
+  - Public subnet (IGW)
+  - Private subnet (NAT egress)
+  - VPC Flow Logs to CloudWatch Logs
+  - SSM Interface Endpoints (ssm, ssmmessages, ec2messages) for "offline" connection
+  - Victim: ANY ingress; ANY egress + SSM endpoints (443 to VPCE SG)
+  - Collector: NO public IP; inbound only from Victim (8000-8001); outbound internet (80/443 + DNS) + SSM endpoints
+
+Parameters:
+  VictimAmi:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+  CollectorAmi:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id
+
+Resources:
+
+  # -------------------------
+  # VPC
+  # -------------------------
+  InsecureVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: insecure
+
+  # -------------------------
+  # Internet Gateway + attachment
+  # -------------------------
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: igw_insecure
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref InsecureVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # -------------------------
+  # Public Subnet (Victim + NAT + VPC endpoints)
+  # -------------------------
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref InsecureVPC
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: sn_public
+
+  # -------------------------
+  # Private Subnet (Collector)
+  # -------------------------
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref InsecureVPC
+      CidrBlock: 10.0.2.0/24
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: sn_private
+
+  # -------------------------
+  # Public Route Table (0.0.0.0/0 -> IGW)
+  # -------------------------
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref InsecureVPC
+      Tags:
+        - Key: Name
+          Value: rt_public
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  # -------------------------
+  # NAT Gateway (public subnet) + EIP
+  # -------------------------
+  NatEip:
+    Type: AWS::EC2::EIP
+    DependsOn: AttachGateway
+    Properties:
+      Domain: vpc
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnet
+      Tags:
+        - Key: Name
+          Value: nat_insecure
+
+  # -------------------------
+  # Private Route Table (0.0.0.0/0 -> NAT)
+  # -------------------------
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref InsecureVPC
+      Tags:
+        - Key: Name
+          Value: rt_private
+
+  DefaultPrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet
+      RouteTableId: !Ref PrivateRouteTable
+
+  # -------------------------
+  # CloudWatch Log Group for VPC Flow Logs
+  # -------------------------
+  VPCFlowLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /vpc/flowlogs/${AWS::StackName}
+      RetentionInDays: 14
+
+  # -------------------------
+  # IAM role for VPC Flow Logs -> CloudWatch Logs
+  # -------------------------
+  VPCFlowLogsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub vpc-flowlogs-role-${AWS::StackName}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: vpc-flow-logs.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: vpc-flowlogs-to-cw
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: '*'
+
+  VPCFlowLogs:
+    Type: AWS::EC2::FlowLog
+    Properties:
+      ResourceType: VPC
+      ResourceId: !Ref InsecureVPC
+      TrafficType: ALL
+      LogDestinationType: cloud-watch-logs
+      LogGroupName: !Ref VPCFlowLogGroup
+      DeliverLogsPermissionArn: !GetAtt VPCFlowLogsRole.Arn
+
+  # -------------------------
+  # Security Groups
+  # -------------------------
+  VictimSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: sg_victim
+      GroupDescription: Victim SG - ANY ingress, egress tightly scoped
+      VpcId: !Ref InsecureVPC
+      Tags:
+        - Key: Name
+          Value: sg_victim
+
+  CollectorSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: sg_collector
+      GroupDescription: Collector SG - ingress only from victim, egress to internet + SSM endpoints
+      VpcId: !Ref InsecureVPC
+      Tags:
+        - Key: Name
+          Value: sg_collector
+
+  VPCEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: sg_vpce_ssm
+      GroupDescription: SG for SSM Interface Endpoints (allow 443 from victim/collector)
+      VpcId: !Ref InsecureVPC
+      Tags:
+        - Key: Name
+          Value: sg_vpce_ssm
+
+  # --- SG Rules ---
+## Victim Security Group Rules
+
+  # Victim: ANY/ANY ingress (intentionally insecure victim)
+  VictimIngressAnyAny:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref VictimSecurityGroup
+      IpProtocol: -1
+      CidrIp: 0.0.0.0/0
+
+  # Victim egress: ONLY to SSM endpoints. This is in place in case I want to restrict egress later on. (443 via SG-to-SG)
+  VictimEgressToSSMEndpoints443:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref VictimSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      DestinationSecurityGroupId: !Ref VPCEndpointSecurityGroup
+
+  # Victim: ANY/ANY egress (intentionally insecure victim)
+  VictimEgressAnyAny:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref VictimSecurityGroup
+      IpProtocol: -1
+      CidrIp: 0.0.0.0/0
+
+## Collector Rules
+
+  # Collector: inbound only from Victim on 8000-8001
+  CollectorIngressFromVictim8000to8001:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref CollectorSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8000
+      ToPort: 8001
+      SourceSecurityGroupId: !Ref VictimSecurityGroup
+
+  CollectorEgressHttpInternet:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref CollectorSecurityGroup
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      CidrIp: 0.0.0.0/0
+
+  CollectorEgressDnsUdp:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref CollectorSecurityGroup
+      IpProtocol: udp
+      FromPort: 53
+      ToPort: 53
+      CidrIp: 0.0.0.0/0
+
+  # Collector egress: ALSO allow 443 to the SSM endpoints explicitly (deterministic SSM even if you later tighten 443)
+  CollectorEgressToSSMEndpoints443:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref CollectorSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      DestinationSecurityGroupId: !Ref VPCEndpointSecurityGroup
+
+  # Collector egress: allow outbound internet (via NAT) for updates/tools
+  CollectorEgressHttpsInternet:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref CollectorSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: 0.0.0.0/0
+
+## Endpoint Rules
+  # Endpoint SG: allow 443 from Victim/Collector SGs to endpoint ENIs
+  VPCEndpointIngress443FromVictimSG:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref VPCEndpointSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourceSecurityGroupId: !Ref VictimSecurityGroup
+
+  VPCEndpointIngress443FromCollectorSG:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref VPCEndpointSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourceSecurityGroupId: !Ref CollectorSecurityGroup
+
+  # Endpoint SG egress: any/any (typical for interface endpoints)
+  VPCEndpointEgressAnyAny:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref VPCEndpointSecurityGroup
+      IpProtocol: -1
+      CidrIp: 0.0.0.0/0
+
+
+  # -------------------------
+  # VPC Interface Endpoints for SSM
+  # -------------------------
+  SSMEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref InsecureVPC
+      VpcEndpointType: Interface
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ssm
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+
+  EC2MessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref InsecureVPC
+      VpcEndpointType: Interface
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ec2messages
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+
+  SSMMessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref InsecureVPC
+      VpcEndpointType: Interface
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ssmmessages
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+
+  # -------------------------
+  # Instance IAM Roles + Instance Profiles (SSM on both)
+  # -------------------------
+  VictimInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub role-victim-ssm-${AWS::StackName}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  VictimInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub ip-victim-ssm-${AWS::StackName}
+      Roles:
+        - !Ref VictimInstanceRole
+
+  CollectorInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub role-collector-ssm-${AWS::StackName}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  CollectorInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub ip-collector-ssm-${AWS::StackName}
+      Roles:
+        - !Ref CollectorInstanceRole
+
+  # -------------------------
+  # EC2 Instances
+  # -------------------------
+  VictimInstance:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - SSMEndpoint
+      - EC2MessagesEndpoint
+      - SSMMessagesEndpoint
+      - DefaultPublicRoute
+    Properties:
+      InstanceType: t3.medium
+      ImageId: !Ref VictimAmi
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref VictimSecurityGroup
+      IamInstanceProfile: !Ref VictimInstanceProfile
+      Tags:
+        - Key: Name
+          Value: victim-insecure
+
+  CollectorInstance:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - NatGateway
+      - DefaultPrivateRoute
+      - SSMEndpoint
+      - EC2MessagesEndpoint
+      - SSMMessagesEndpoint
+    Properties:
+      InstanceType: t3.large
+      ImageId: !Ref CollectorAmi
+      SubnetId: !Ref PrivateSubnet
+      UserData:
+        Fn::Base64: !Sub |
+          #cloud-config
+          package_update: true
+          runcmd:
+            - snap install amazon-ssm-agent --classic || true
+            - systemctl daemon-reload
+            - systemctl enable snap.amazon-ssm-agent.amazon-ssm-agent
+            - systemctl restart snap.amazon-ssm-agent.amazon-ssm-agent
+      SecurityGroupIds:
+        - !Ref CollectorSecurityGroup
+      IamInstanceProfile: !Ref CollectorInstanceProfile
+      Tags:
+        - Key: Name
+          Value: collector
+
+Outputs:
+  VpcId:
+    Description: VPC ID
+    Value: !Ref InsecureVPC
+
+  PublicSubnetId:
+    Description: Public subnet ID
+    Value: !Ref PublicSubnet
+
+  PrivateSubnetId:
+    Description: Private subnet ID
+    Value: !Ref PrivateSubnet
+
+  NatGatewayId:
+    Description: NAT Gateway ID
+    Value: !Ref NatGateway
+
+  VictimSecurityGroupId:
+    Description: Victim SG ID
+    Value: !Ref VictimSecurityGroup
+
+  CollectorSecurityGroupId:
+    Description: Collector SG ID
+    Value: !Ref CollectorSecurityGroup
+
+  VPCEndpointSecurityGroupId:
+    Description: SSM VPC Endpoint SG ID
+    Value: !Ref VPCEndpointSecurityGroup
+
+  VictimInstanceId:
+    Description: Victim EC2 instance ID
+    Value: !Ref VictimInstance
+
+  CollectorInstanceId:
+    Description: Collector EC2 instance ID
+    Value: !Ref CollectorInstance
+
+  FlowLogGroupName:
+    Description: CloudWatch Log Group for VPC Flow Logs
+    Value: !Ref VPCFlowLogGroup
