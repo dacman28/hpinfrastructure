@@ -442,7 +442,7 @@ Resources:
       - EC2MessagesEndpoint
       - SSMMessagesEndpoint
     Properties:
-      InstanceType: t3.large
+      InstanceType: t3.medium
       ImageId: !Ref CollectorAmi
       SubnetId: !Ref PrivateSubnet
       UserData:
